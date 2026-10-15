@@ -1,0 +1,8 @@
+{
+  "workbench.colorCustomizations": {
+    "statusBar.background": "#993392",
+    "statusBar.foreground": "#ffffff",
+    "sash.hoverBorder": "#993392"
+  },
+  "python.terminal.useEnvFile": true
+}
