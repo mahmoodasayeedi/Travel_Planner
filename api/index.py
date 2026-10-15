@@ -20,14 +20,6 @@ PRICING = {
 DEFAULT_PRICE = (2.50, 10.00)
 
 
-# ---- web shim: collect itineraries instead of notebook display() ----
-_pending = []
-class Markdown(str):
-    pass
-def display(x):
-    _pending.append(str(x))
-
-
 class UsageTracker:
     def __init__(self):
         self.calls = []
@@ -60,7 +52,8 @@ class UsageTracker:
         ti = sum(c["input"] for c in self.calls); to = sum(c["output"] for c in self.calls)
         print(f"{'TOTAL':<40}{ti:>9}{to:>9}{self.total_cost:>10.4f}   (≈ ${self.total_cost:.4f})")
 
-tracker = UsageTracker()
+from contextvars import ContextVar
+_tracker = ContextVar("tracker", default=UsageTracker())
 
 def llm(model, system, messages, purpose, tools=None, tool_choice=None, max_tokens=1024):
     """Single choke point for every API call -> usage is always tracked."""
@@ -70,7 +63,7 @@ def llm(model, system, messages, purpose, tools=None, tool_choice=None, max_toke
     if tool_choice: kwargs["tool_choice"] = tool_choice
     t0 = time.time()
     resp = client.chat.completions.create(**kwargs)
-    tracker.record(model, resp.usage, purpose, time.time() - t0)
+    _tracker.get().record(model, resp.usage, purpose, time.time() - t0)
     return resp
 
 MAX_USER_CHARS = 1000
@@ -314,8 +307,7 @@ def run_tool(session, name, args):
                 revision_notes=clean_str(args.get("revision_notes", ""), 300),
                 previous=session.itinerary)
             session.itinerary = it
-            display(Markdown(render_itinerary(it)))                 # shown directly -> the chat model does not re-type it
-            return {"status": "ok", "message": "Itinerary generated and already displayed to the user.",
+            return {"status": "ok", "message": "Itinerary generated and shown to the user next to your message.",
                     "title": it["title"], "days": len(it["days"])}
         return {"error": "Unknown tool."}
     except Exception as e:
@@ -352,45 +344,75 @@ def chat_turn(session, user_text):
     return "Sorry, I got stuck. Could you rephrase your request?"
 
 
-# ======================= WEB UI (Gradio) =======================
-import gradio as gr
+# ======================= HTTP API (FastAPI on Vercel) =======================
+import hmac
+from typing import Optional
+from fastapi import FastAPI, Header, HTTPException
+from pydantic import BaseModel, Field
 
-GREETING = ("👋 Hi! I'm Aria, your AI travel advisor. Where would you like to go, "
-            "for how long, and what do you enjoy (food, museums, hiking, beaches, nightlife…)?")
+app = FastAPI()
+ACCESS_CODE = os.getenv("ACCESS_CODE", "")      # optional shared password to protect your OpenAI credit
 
-def usage_text():
-    ti = sum(c["input"] for c in tracker.calls); to = sum(c["output"] for c in tracker.calls)
-    return f"**Tokens:** {ti:,} in / {to:,} out  ·  **Est. cost:** ${tracker.total_cost:.4f}"
 
-def respond(message, history, session):
-    session = session or Session()
-    history = history or []
-    history.append({"role": "user", "content": message})
-    _pending.clear()
-    reply = chat_turn(session, message)
-    for md in _pending:                      # the generated itinerary (Markdown)
-        history.append({"role": "assistant", "content": md})
-    history.append({"role": "assistant", "content": reply})
-    return "", history, session, usage_text()
+class Msg(BaseModel):
+    role: str
+    content: str = Field(max_length=4000)
 
-def reset():
-    return [{"role": "assistant", "content": GREETING}], Session(), usage_text()
 
-def build_ui():
-    with gr.Blocks(title="AI Travel Advisor") as demo:
-        gr.Markdown("# ✈️ AI Travel Advisor\nTell me about your trip and I'll plan it.")
-        try:
-            chatbot = gr.Chatbot(value=[{"role": "assistant", "content": GREETING}],
-                                 type="messages", height=560)
-        except TypeError:                    # newer Gradio versions: messages format is the default
-            chatbot = gr.Chatbot(value=[{"role": "assistant", "content": GREETING}], height=560)
-        box = gr.Textbox(placeholder="e.g. 5 days in Lisbon, I love food and history…", show_label=False)
-        usage = gr.Markdown(usage_text())
-        state = gr.State(None)
-        box.submit(respond, [box, chatbot, state], [box, chatbot, state, usage])
-        gr.Button("New trip").click(reset, None, [chatbot, state, usage])
-    return demo
+class ChatIn(BaseModel):
+    message: str = Field(max_length=MAX_USER_CHARS)
+    history: list[Msg] = Field(default_factory=list, max_length=40)
+    summary: str = Field(default="", max_length=4000)
+    itinerary: Optional[dict] = None
 
-if __name__ == "__main__":
-    # Cloud hosts (Render etc.) give the port via $PORT and need 0.0.0.0; locally this still works on 7860.
-    build_ui().launch(server_name="0.0.0.0", server_port=int(os.getenv("PORT", 7860)))
+
+def check_access(code):
+    if ACCESS_CODE and not hmac.compare_digest(code or "", ACCESS_CODE):
+        raise HTTPException(status_code=401, detail="Wrong access code.")
+
+
+@app.get("/api/config")
+def config():
+    return {"access_code_required": bool(ACCESS_CODE)}
+
+
+@app.post("/api/chat")
+def chat(body: ChatIn, x_access_code: Optional[str] = Header(default=None)):
+    check_access(x_access_code)
+    tr = UsageTracker()
+    _tracker.set(tr)
+
+    # Rebuild the session from what the browser sent. The server stores nothing.
+    # Only plain user/assistant text is accepted (no forged tool messages), and user text is re-screened.
+    session = Session()
+    session.summary = body.summary
+    for m in body.history:
+        if m.role not in ("user", "assistant") or not m.content.strip():
+            continue
+        if m.role == "user" and not screen_user_input(m.content)[0]:
+            continue
+        session.messages.append({"role": m.role, "content": m.content})
+    it = body.itinerary
+    if it and isinstance(it.get("title"), str) and isinstance(it.get("days"), list) \
+            and len(json.dumps(it)) <= 20000:
+        session.itinerary = it
+    original = session.itinerary
+
+    try:
+        reply = chat_turn(session, body.message)
+    except Exception as e:
+        print("chat error:", type(e).__name__, e)          # visible in Vercel logs only
+        raise HTTPException(status_code=502, detail="The AI service had a problem. Please try again.")
+
+    history = [{"role": m["role"], "content": m["content"]} for m in session.messages
+               if m["role"] in ("user", "assistant") and m.get("content") and not m.get("tool_calls")]
+    return {
+        "reply": reply,
+        "history": history,
+        "summary": session.summary,
+        "itinerary": session.itinerary,
+        "itinerary_new": session.itinerary is not original,
+        "usage": {"input": sum(c["input"] for c in tr.calls),
+                  "output": sum(c["output"] for c in tr.calls),
+                  "cost": round(tr.total_cost, 5)},
+    }
