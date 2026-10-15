@@ -428,6 +428,7 @@ PAGE = r"""<!doctype html>
 </form>
 
 <script>
+const ACCESS_REQUIRED = __ACCESS_REQUIRED__;
 const GREETING = "👋 Hi! I'm Aria, your AI travel advisor. Where would you like to go, for how long, and what do you enjoy (food, museums, hiking, beaches, nightlife…)?";
 const chat = document.getElementById('chat'), form = document.getElementById('form'),
       input = document.getElementById('msg'), sendBtn = document.getElementById('send'),
@@ -488,9 +489,7 @@ function reset() { state = fresh(); chat.replaceChildren(); bubble('bot', GREETI
 document.getElementById('new').addEventListener('click', reset);
 
 // optional access code (only shown if the server has ACCESS_CODE set)
-fetch('/api/config').then(r => r.json()).then(c => {
-  if (c.access_code_required) { codeEl.style.display = 'block'; codeEl.value = sessionStorage.getItem('code') || ''; }
-}).catch(() => {});
+if (ACCESS_REQUIRED) { codeEl.style.display = 'block'; codeEl.value = sessionStorage.getItem('code') || ''; }
 codeEl.addEventListener('input', () => sessionStorage.setItem('code', codeEl.value));
 
 form.addEventListener('submit', async e => {
@@ -529,9 +528,13 @@ reset();
 """
 
 
+def page_response():
+    return HTMLResponse(PAGE.replace("__ACCESS_REQUIRED__", "true" if ACCESS_CODE else "false"))
+
+
 @app.get("/", response_class=HTMLResponse)
 def home():
-    return PAGE
+    return page_response()
 
 
 @app.get("/api/config")
@@ -540,6 +543,7 @@ def config():
 
 
 @app.post("/api/chat")
+@app.post("/api/index")
 def chat(body: ChatIn, x_access_code: Optional[str] = Header(default=None)):
     check_access(x_access_code)
     tr = UsageTracker()
@@ -579,3 +583,8 @@ def chat(body: ChatIn, x_access_code: Optional[str] = Header(default=None)):
                   "output": sum(c["output"] for c in tr.calls),
                   "cost": round(tr.total_cost, 5)},
     }
+
+
+@app.get("/{full_path:path}", response_class=HTMLResponse)
+def catch_all(full_path: str):
+    return page_response()
