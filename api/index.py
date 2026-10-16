@@ -3,21 +3,34 @@ from datetime import date
 import requests
 from openai import OpenAI
 
+#-------------------------------------------------------------------------------------
+##   CONFIGURATION
+#--------------------------------------------------------------------------------------
+
 if not os.getenv("OPENAI_API_KEY"):
     raise SystemExit("Set the OPENAI_API_KEY environment variable first.")
 client = OpenAI()
 
-CHAT_MODEL      = "gpt-4o-mini"   # cheap + fast: conversation, tool routing
-ITINERARY_MODEL = "gpt-4o"        # stronger: writes the final plan
+#-------------------------------------------------------------------------------------
+##  MODELS
+#--------------------------------------------------------------------------------------
+
+CHAT_MODEL      = "gpt-6-luna"   # cheap + fast: conversation, tool routing
+ITINERARY_MODEL = "gpt-6.1-sol"        # stronger: writes the final plan
+IMAGE_MODEL = "gpt-image-2.5-flare"
 
 # USD per 1M tokens (input, output) -- ASSUMED values, update from the pricing page
 PRICING = {
-    "gpt-4o-mini":  (0.15, 0.60),
-    "gpt-4.1-mini": (0.40, 1.60),
-    "gpt-4o":       (2.50, 10.00),
-    "gpt-4.1":      (2.00, 8.00),
-}
+    "gpt-6-luna":  (0.15, 0.60),
+    "gpt-6.1-sol": (0.40, 1.60),
+    "gpt-image-2.5-flare":(2.50, 10.00),
+   }
 DEFAULT_PRICE = (2.50, 10.00)
+
+
+#-------------------------------------------------------------------------------------
+##   USAGE TRACKER
+#--------------------------------------------------------------------------------------
 
 
 class UsageTracker:
@@ -95,13 +108,19 @@ def clean_str(s, max_len=80):
     s = re.sub(r"[^\w\s,.'&()\-/]", "", str(s), flags=re.UNICODE)
     return re.sub(r"\s+", " ", s)[:max_len].strip()
 
+#-------------------------------------------------------------------------------------
+##   GETTING WEATHER
+#--------------------------------------------------------------------------------------
+
 def get_weather(city, days=7):
     try:
+        # 1. Turn the city name into coordinates
         g = requests.get("https://geocoding-api.open-meteo.com/v1/search",
                          params={"name": city, "count": 1}, timeout=10).json()
         if not g.get("results"):
             return {"error": f"Could not find '{city}'."}
         r = g["results"][0]
+        # 2. Get the daily forecast for those coordinates
         f = requests.get("https://api.open-meteo.com/v1/forecast", timeout=10, params={
             "latitude": r["latitude"], "longitude": r["longitude"], "timezone": "auto",
             "daily": "temperature_2m_max,temperature_2m_min,precipitation_probability_max",
